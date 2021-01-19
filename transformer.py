@@ -4,9 +4,28 @@ import matplotlib.pyplot as plt
 
 import tensorflow as tf
 import tensorflow_datasets as tfds  
-from tf.keras.models import Sequential
+from tensorflow.keras.models import Sequential
 from utils import *
-from tf.keras.layers import Dense, LayerNormalization, Dropout, Embedding
+from tensorflow.keras.layers import Dense, LayerNormalization, Dropout, Embedding
+
+class TokenEncoder:
+    def __init__(self, tokenizer1, tokenizer2):
+        self.tokenizer1 = tokenizer1
+        self.tokenizer2 = tokenizer2
+
+    def encode(self, lang1, lang2):
+        #adding tokens for start and end as well, vocab size is idx for start, vocab size + 1 is idx for end
+        lang1 = [self.tokenizer1.vocab_size]+self.tokenizer1.encode(lang1.numpy())+[self.tokenizer1.vocab_size+1]
+        lang2 = [self.tokenizer2.vocab_size]+self.tokenizer2.encode(lang2.numpy())+[self.tokenizer2.vocab_size+1]
+        return lang1, lang2 
+
+    def tf_encode(self, lang1, lang2):
+        #we wrap the encode function as a tensorflow py_function so that it can be used together on each element of the dataset
+        result_1, result_2 = tf.py_function(self.encode, [lang1, lang2], [tf.int64, tf.int64])
+        result_1.set_shape([None])
+        result_2.set_shape([None])
+        #set shape to None allows any shape for the particular axis
+        return result_1, result_2
 
 class MultiHeadAttention:
     def __init__(self, d_model, heads):
@@ -74,7 +93,7 @@ class EncoderLayer(tf.keras.layers.Layer):
         super(EncoderLayer, self).__init__()
 
         self.mha = MultiHeadAttention(d_model, num_heads)
-        self.ffn = point_wise_feed_forward_nn(d_model, hidden)
+        self.ffn = Utils.point_wise_feed_forward_nn(d_model, hidden)
 
         self.layernorm1 = LayerNormalization(epsilon=1e-6)
         self.layernorm2 = LayerNormalization(epsilon=1e-6)
@@ -100,7 +119,7 @@ class DecoderLayer(tf.keras.layers.Layer):
         self.mha1 = MultiHeadAttention(d_model, num_head)
         self.mha2 = MultiHeadAttention(d_model, num_head)
 
-        self.ffn = point_wise_feed_forward_nn(d_model, hidden)
+        self.ffn = Utils.point_wise_feed_forward_nn(d_model, hidden)
 
         self.layernorm1 = LayerNormalization(epsilon=1e-6)
         self.layernorm2 = LayerNormalization(epsilon=1e-6)
@@ -183,19 +202,63 @@ class Decoder(tf.keras.layers.Layer):
 
         return x, attention_weights
 
+class Transformer(tf.keras.Model):
+    def __init__(self, num_layers, d_model, num_heads, hidden, input_vocab_size, target_vocab_size, t_input, t_target, dropout_rate=0.1):
+        super(Transformer, self).__init__()
+
+        self.encoder = Encoder(num_layers, d_model, num_heads, hidden, input_vocab_size, t_input, dropout_rate)
+        self.decoder = Encoder(num_layers, d_model, num_heads, hidden, target_vocab_size, t_target, dropout_rate)
+
+        self.final_layer = Dense(target_vocab_size)
+
+    def forward(self, inp, tar, training, enc_padding_mask, look_ahead_mask, dec_padding_mask):
+        enc_output = self.encoder.forward(inp, training, enc_padding_mask)
+
+        dec_output, attention_weights = self.decoder.forward(tar, enc_output, training, look_ahead_mask, dec_padding_mask)
+
+        final_output = self.final_layer(dec_output)
+        return final_output, attention_weights
+
+class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, d_model, warmup_steps=4000):
+        super(CustomSchedule, self).__init__()
+        self.d_model = d_model
+        self.d_model = tf.cast(self.d_model, tf.float32)
+
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        arg1 = tf.math.rsqrt(step)
+        arg2 = step * (self.warmup_steps ** -1.5)
+
 if __name__=="__main__":
     examples, metadata = tfds.load('ted_hrlr_translate/pt_to_en', with_info=True, as_supervised=True)
-    train, val = examples['train'], examples['val']
+    train, val = examples['train'], examples['validation']
 
-    '''
-    #instantiating a transformer and loading dataset
-    transformer = Transformer(train, val)
-    train_ds = train.map(transformer.tf_encode)
-    train_ds = train_ds.filter(tranformer.filter_max_length)
-    train_ds = train_ds.cache()
-    train_ds = train_ds.shuffle(transformer.buffer_size).padded_batch(transformer.batch_size)
+    tokenizer1, tokenizer2 = initialize(train, val)
 
-    val_ds = val.map(transformer.tf_encode)
-    val_ds = val_ds.filter(transformer.filter_max_length).padded_batch(transformer.batch_size)
-    '''
+    BUFFER_SIZE = 20000
+    BATCH_SIZE = 64
+    MAX_LENGTH = 40
 
+    tokenencode = TokenEncoder(tokenizer1, tokenizer2)
+
+    train_dataset = train.map(tokenencode.tf_encode)
+    train_dataset = train_dataset.filter(filter_max_length)
+
+    train_dataset = train_dataset.cache()
+    train_dataset = train_dataset.shuffle(BUFFER_SIZE).padded_batch(BATCH_SIZE)
+    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
+
+    val_dataset = val.map(tokenencode.tf_encode)
+    val_dataset = val_dataset.filter(filter_max_length)
+
+    num_layers = 4
+    d_model = 128
+    hidden = 512
+    num_heads = 8
+    #depth will be 16
+
+    input_vocab_size = tokenizer1.vocab_size + 2
+    target_vocab_size = tokenizer2.vocab_size + 2
+    dropout_rate = 0.1
